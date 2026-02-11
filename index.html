@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>People Counting (IN/OUT)</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 0; background:#0b1220; color:#eaf0ff; }
+    .wrap { display:flex; gap:12px; padding:12px; flex-wrap:wrap; }
+    .card { background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); border-radius:14px; padding:12px; }
+    .panel { min-width:240px; flex:1; }
+    .videoBox { position:relative; border-radius:14px; overflow:hidden; }
+    video, canvas { width: 100%; height: auto; display:block; }
+    canvas { position:absolute; inset:0; }
+    .big { font-size:44px; font-weight:800; line-height:1; }
+    .row { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    button, input { padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); color:#eaf0ff; }
+    button { cursor:pointer; }
+    .pill { padding:6px 10px; border-radius:999px; font-weight:700; }
+    .in { background:#1f3bff33; border:1px solid #6b7dff66; }
+    .out { background:#ff2a2a33; border:1px solid #ff7a7a66; }
+    .muted { opacity:.75; font-size:13px; }
+    label { display:block; font-size:13px; opacity:.85; margin-bottom:6px; }
+  </style>
+
+  <!-- TensorFlow.js + COCO-SSD -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card panel" style="flex:2; min-width:320px;">
+      <div class="row" style="margin-bottom:10px;">
+        <div>
+          <div style="font-weight:800;">People Counting</div>
+          <div class="muted">Conta cruzamento em uma linha vertical (IN/OUT)</div>
+        </div>
+        <button id="btnStart">Iniciar</button>
+      </div>
+
+      <div class="videoBox">
+        <video id="video" playsinline muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+
+      <div class="row" style="margin-top:10px; flex-wrap:wrap;">
+        <div style="min-width:220px;">
+          <label>Linha (X) em % do vídeo</label>
+          <input id="lineX" type="range" min="10" max="90" value="50" />
+          <div class="muted">Dica: posicione onde as pessoas passam (porta/corredor).</div>
+        </div>
+        <div style="min-width:220px;">
+          <label>Confiança mínima</label>
+          <input id="minScore" type="range" min="20" max="80" value="50" />
+          <div class="muted">Ajuste se estiver contando “falso positivo”.</div>
+        </div>
+        <button id="btnReset">Zerar</button>
+      </div>
+    </div>
+
+    <div class="card panel" style="min-width:260px;">
+      <div class="row" style="margin-bottom:10px;">
+        <span class="pill in">IN</span>
+        <div class="big" id="inCount">0</div>
+      </div>
+      <div class="row" style="margin-bottom:18px;">
+        <span class="pill out">OUT</span>
+        <div class="big" id="outCount">0</div>
+      </div>
+
+      <div class="muted" id="status">Status: parado</div>
+      <hr style="border:none;border-top:1px solid rgba(255,255,255,.12); margin:14px 0;">
+      <div class="muted">
+        <b>Observações rápidas</b><br>
+        • Em celulares fracos, reduza resolução da câmera.<br>
+        • Para produção, use tracking mais robusto (ByteTrack/DeepSORT) e/ou modelo nativo.<br>
+        • Pode ser configurado para linha horizontal também.
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const btnStart = document.getElementById('btnStart');
+  const btnReset = document.getElementById('btnReset');
+  const inEl = document.getElementById('inCount');
+  const outEl = document.getElementById('outCount');
+  const statusEl = document.getElementById('status');
+  const lineXEl = document.getElementById('lineX');
+  const minScoreEl = document.getElementById('minScore');
+
+  let model = null;
+  let running = false;
+  let inCount = 0, outCount = 0;
+
+  // Tracking simples por centroid + nearest neighbor
+  let tracks = new Map(); // id -> {x,y,lastSeen,side,countedCooldown}
+  let nextId = 1;
+
+  const MAX_DIST = 80;      // distância máxima para associar detecção a track (px)
+  const FORGET_MS = 800;    // remove track se sumiu
+  const COOLDOWN_MS = 700;  // evita contar múltiplas vezes no mesmo cruzamento
+
+  function setStatus(t){ statusEl.textContent = "Status: " + t; }
+
+  function resizeCanvas() {
+    const rect = video.getBoundingClientRect();
+    canvas.width = Math.round(rect.width);
+    canvas.height = Math.round(rect.height);
+  }
+
+  function drawLine(lineX) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(80,150,255,.9)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(lineX, 0);
+    ctx.lineTo(lineX, canvas.height);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBox(det, color='rgba(0,255,160,.9)') {
+    const [x,y,w,h] = det.bbox;
+    const sx = canvas.width / video.videoWidth;
+    const sy = canvas.height / video.videoHeight;
+    const X = x*sx, Y=y*sy, W=w*sx, H=h*sy;
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(X, Y, W, H);
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillRect(X, Y-18, Math.min(W, 160), 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px system-ui';
+    ctx.fillText(`person ${(det.score*100).toFixed(0)}%`, X+6, Y-5);
+    ctx.restore();
+
+    return { cx: X + W/2, cy: Y + H/2 };
+  }
+
+  function sideOfLine(cx, lineX) {
+    return (cx < lineX) ? 'L' : 'R';
+  }
+
+  function updateCounters() {
+    inEl.textContent = inCount;
+    outEl.textContent = outCount;
+  }
+
+  function associateDetectionsToTracks(points) {
+    const now = performance.now();
+    const usedTracks = new Set();
+    const assignments = [];
+
+    for (const p of points) {
+      let bestId = null;
+      let bestD = Infinity;
+
+      for (const [id, tr] of tracks.entries()) {
+        if (usedTracks.has(id)) continue;
+        const dx = p.cx - tr.x;
+        const dy = p.cy - tr.y;
+        const d = Math.hypot(dx, dy);
+        if (d < bestD) { bestD = d; bestId = id; }
+      }
+
+      if (bestId && bestD < MAX_DIST) {
+        usedTracks.add(bestId);
+        assignments.push({ id: bestId, cx: p.cx, cy: p.cy });
+      } else {
+        const id = nextId++;
+        usedTracks.add(id);
+        assignments.push({ id, cx: p.cx, cy: p.cy, isNew: true });
+      }
+    }
+
+    for (const a of assignments) {
+      const prev = tracks.get(a.id);
+      tracks.set(a.id, {
+        x: a.cx,
+        y: a.cy,
+        lastSeen: now,
+        side: prev?.side ?? null,
+        countedCooldown: prev?.countedCooldown ?? 0
+      });
+    }
+
+    for (const [id, tr] of tracks.entries()) {
+      if (now - tr.lastSeen > FORGET_MS) tracks.delete(id);
+    }
+
+    return assignments;
+  }
+
+  function processCrossing(lineX) {
+    const now = performance.now();
+    for (const [id, tr] of tracks.entries()) {
+      const currentSide = sideOfLine(tr.x, lineX);
+      const prevSide = tr.side;
+
+      if (prevSide && prevSide !== currentSide) {
+        if (now > tr.countedCooldown) {
+          if (prevSide === 'L' && currentSide === 'R') inCount++;
+          if (prevSide === 'R' && currentSide === 'L') outCount++;
+          tr.countedCooldown = now + COOLDOWN_MS;
+          updateCounters();
+        }
+      }
+      tr.side = currentSide;
+      tracks.set(id, tr);
+    }
+  }
+
+  async function loop() {
+    if (!running) return;
+
+    resizeCanvas();
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    const lineX = (Number(lineXEl.value)/100) * canvas.width;
+    const minScore = Number(minScoreEl.value) / 100;
+
+    drawLine(lineX);
+
+    const preds = await model.detect(video);
+    const people = preds.filter(p => p.class === 'person' && p.score >= minScore);
+
+    const points = [];
+    for (const det of people) {
+      const {cx, cy} = drawBox(det);
+      points.push({cx, cy});
+    }
+
+    associateDetectionsToTracks(points);
+    processCrossing(lineX);
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    ctx.font = '12px system-ui';
+    for (const [id, tr] of tracks.entries()) {
+      ctx.fillText(`#${id}`, tr.x + 6, tr.y - 6);
+    }
+    ctx.restore();
+
+    requestAnimationFrame(loop);
+  }
+
+  async function start() {
+    if (running) return;
+    setStatus("carregando modelo...");
+    btnStart.disabled = true;
+
+    if (!model) model = await cocoSsd.load();
+
+    setStatus("abrindo câmera...");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "environment",
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    running = true;
+    btnStart.textContent = "Rodando";
+    setStatus("rodando");
+    btnStart.disabled = false;
+
+    requestAnimationFrame(loop);
+  }
+
+  btnStart.addEventListener('click', start);
+  btnReset.addEventListener('click', () => {
+    inCount = 0; outCount = 0;
+    tracks.clear();
+    updateCounters();
+  });
+
+})();
+</script>
+</body>
+</html>
